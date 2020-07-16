@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+
+DHL_UPDATE_DELAY=60 #seconds
+DHL_NOTIFICATION_LONG_DURATION=300000 #milliseconds (How long to display notifications on desktop while using live tracking)
+DHL_NOTIFICATION_TITLE_PREFIX="DHL Tracking Status"
+DHL_ANDROID_LF_EVERY=56 # insert linebreaks into status update every n characters on Android so you can read the full msg
+DHL_LANGUAGE="en" # DHL status message language # auto detect language: "$(echo "${LANG}" | cut -d= -f2 | cut -d_ -f1)"
+DHL_SEPARATOR="-------------------------" # Used to separate status updates
+DHL_ICON_URL="https://www.dhl.de/content/de/de/privatkunden/kampagnenseiten/dhl-app/jcr:content/par/responsivegrid_1316292841/responsivepar/article/image/img.sly.1594387261684.1600.medium.png"
+#DHL_ICON_LOCATION="/tmp/dhl.png" # Location where to save the icon
+DHL_APP_NAME="DHL"
+
+DHL_DEPENDENCIES=( "echo" "read" "sleep" "tail" "head" "fold" "clear" "sed" "date" "command" "curl" "wget" "jq" )
+DHL_DEPENDENCIES_LINUX_RECOMMENDED=( "notify-send" )
+DHL_DEPENDENCIES_TERMUX_RECOMMENDED=( "termux-notification" "termux-dialog" )
+
+###
+ # Check if command is available
+ # @param 1 {string} The name of the command
+ # @returns 0 if command is available, 1 if it is not available
+##
+function isCommandAvailable() {
+    command -v "${1}" > /dev/null;
+}
+
+# Check if required dependencies are installed
+for dep in ${DHL_DEPENDENCIES}; do
+    DHL_DEPENDENCY_MISSING=false
+    if ! isCommandAvailable "${dep}"; then
+        DHL_DEPENDENCY_MISSING=true
+        echo "[ERROR] The dependency \"${dep}\" is missing. Please install it!"
+    fi
+    
+    if [ "${DHL_DEPENDENCY_MISSING}" == true ]; then
+        exit 1
+    fi
+done
+
+# Check if optional dependencies are installed
+if isCommandAvailable "termux-setup-storage"; then # if using Termux
+    for dep in ${DHL_DEPENDENCIES_TERMUX_RECOMMENDED}; do
+        if ! isCommandAvailable "${dep}"; then
+            DHL_DEPENDENCY_MISSING=true
+            echo "[WARNING] Recommended dependency \"${dep}\" is missing. Without it functionality will be limited!"
+        fi
+    done
+else
+    for dep in ${DHL_DEPENDENCIES_LINUX_RECOMMENDED}; do
+        if ! isCommandAvailable "${dep}"; then
+            DHL_DEPENDENCY_MISSING=true
+            echo "[WARNING] Recommended dependency \"${dep}\" is missing. Without it functionality will be limited!"
+        fi
+    done
+fi
+
+# Set DHL_ICON_LOCATION to device's tmp folder if not set
+if [ -z "${DHL_ICON_LOCATION}" ]; then
+    if isCommandAvailable "termux-setup-storage"; then # if using Termux
+        DHL_ICON_LOCATION="${PREFIX}/tmp/dhl.png"
+    else
+        DHL_ICON_LOCATION="/tmp/dhl.png"
+    fi
+fi
+
+# Download icon, unless it's already there
+if [ ! -f "${DHL_ICON_LOCATION}" ]; then
+    echo "Downloading DHL icon..."
+    wget --quiet -O "${DHL_ICON_LOCATION}" "${DHL_ICON_URL}"
+fi
+
+###
+ # Convert date strings like "2020-07-16T00:00:00+02:00" to the local date format. E.g. "Thu, 07/16/2020, 08:10 AM"
+ # @stdin {string} A date that can be parsed by the date command
+ # @stdout {string} The input date reformatted to the local date format with seconds stripped out
+##
+function localizeDate() {
+    read inputDate
+    date -d "${inputDate}" "+%a, %x, %X" | sed 's/:[0-9][0-9]\(,\| \)/\1/g'
+}
+
+###
+ # Reverse the order of items in a given array
+ # @stdin {[]} An arbitrary array
+ # @stdout {string} The given array in reversed order
+##
+function arrayReverse() {
+    sed 'x;1!H;$!d;x'
+}
+
+###
+ # Get a detailed nicely formatted DHL parcel tracking report for the given tracking id
+ # @param 1 {string} The DHL tracking ID
+ # @stdout {string} A multi line report containing all status updates on the given tracking id including dates, times, locations, estimated delivery time and overall progress
+##
+function dhlGetTrackingStatus() {
+    local trackingId=${1}
+    
+    local statusReport="" # This variable will contain a nicely formatted multi line string with all status updates including location and time and expected delivery time
+    
+    #curl -H "User-Agent: Mozilla/5.0 (X11; Fedora; Linux x86_64; rv:76.0) Gecko/20100101 Firefox/76.0" -s "https://www.dhl.de/int-verfolgen/search?lang=${DHL_LANGUAGE}&piececode=${trackingId}" | sed -n "s/^.*<div>Status: \(.*\)<\/div>.*$/\1/p" # Get basic status message without complicated parsing
+    local dhlHtml="$(curl -H "User-Agent: Mozilla/5.0 (X11; Fedora; Linux x86_64; rv:76.0) Gecko/20100101 Firefox/76.0" -s "https://www.dhl.de/int-verfolgen/search?lang=${DHL_LANGUAGE}&piececode=${trackingId}")"
+    local dhlJson="$(echo -en "${dhlHtml}" | sed -n "s/^.*initialState: JSON.parse(\(.*\)).*$/\1/p" | sed 's/\\//g' | tail -c +2 | head -c -2)"
+    
+    local deliveryTimeSlotStart="$(echo "${dhlJson}" | jq '.sendungen[0].sendungsdetails.zustellung.zustellzeitfensterVon' | date "+%a, %x")"
+    local deliveryTimeSlotEnd="$(  echo "${dhlJson}" | jq '.sendungen[0].sendungsdetails.zustellung.zustellzeitfensterBis' | date "+%a, %x")"
+    local progress="$(             echo "${dhlJson}" | jq '.sendungen[0].sendungsdetails.sendungsverlauf.fortschritt')"
+    #local currentStatus="$(       echo "${dhlJson}" | jq '.sendungen[0].sendungsdetails.sendungsverlauf.aktuellerStatus')"
+    #local currentStatusDate="$(   echo "${dhlJson}" | jq '.sendungen[0].sendungsdetails.sendungsverlauf.datumAktuellerStatus' | localizeDate)"
+    local events="$(               echo "${dhlJson}" | jq '.sendungen[0].sendungsdetails.sendungsverlauf.events')"
+    
+    local deliveryDate
+    if [ "${deliveryTimeSlotStart}" != "null" ]; then
+        if [ "${deliveryTimeSlotStart}" == "${deliveryTimeSlotEnd}" ]; then
+            deliveryDate="${deliveryTimeSlotStart}"
+        else
+            deliveryDate="Between ${deliveryTimeSlotStart} and ${deliveryTimeSlotEnd}"
+        fi
+        statusReport="Delivery Date: ${deliveryDate}\n"
+    fi
+    
+    if [ "${progress}" == "null" ]; then
+        progress="0"
+    fi
+    
+    statusReport="${statusReport}Progress: ${progress}/5"
+    
+    for row in $(echo "${events}" | jq -r '.[] | @base64' | arrayReverse); do
+        _jq() {
+            echo ${row} | base64 --decode | jq -r ${1}
+        }
+        local eventDate="$(_jq '.datum' | localizeDate)"
+        local eventStatusMsg="$(_jq '.status')"
+        local eventLocation="$(_jq '.ort')"
+        
+        if [ "${eventLocation}" == "null" ]; then
+            eventLocation=""
+        else
+            eventLocation=", ${eventLocation}"
+        fi
+        
+        statusReport="${statusReport}\n${DHL_SEPARATOR}\n${eventDate}${eventLocation}\n${eventStatusMsg}"
+    done
+    
+    echo -e "${statusReport}"
+}
+
+###
+ # Display a notification with specified contents
+ # @param 1 {string} The notification content/body
+ # @param 2 {string} The notification title suffix
+ # @param 3 {bool} True for a long lived notification false for a short lived notification. (Has no effect on Android/Termux.)
+##
+function dhlNotification() {
+    local notificationContent="${1}"
+    local notificationTitleSuffix="${2}"
+    local notificationPersistent="${3:-false}"
+    
+    if command -v termux-notification > /dev/null; then
+        echo -e "${newDhlStatus}" | fold -w ${DHL_ANDROID_LF_EVERY} -s | termux-notification --group "${DHL_APP_NAME}" --title "${DHL_NOTIFICATION_TITLE_PREFIX} ${notificationTitleSuffix}" --led-color "FFCC00" --sound --image-path "${DHL_ICON_LOCATION}" --action "termux-dialog text -t '${DHL_NOTIFICATION_TITLE_PREFIX} Update' -m -i '${notificationContent}'"
+    elif command -v notify-send > /dev/null; then
+        local expiryTimeParam
+        if [ "${notificationPersistent}" == "true" ]; then
+            expiryTimeParam="--expire-time=${DHL_NOTIFICATION_LONG_DURATION}"
+        else
+            expiryTimeParam=""
+        fi
+        notify-send --app-name="${DHL_APP_NAME}" --icon="${DHL_ICON_LOCATION}" ${expiryTimeParam} "${DHL_NOTIFICATION_TITLE_PREFIX} ${notificationTitleSuffix}" "${notificationContent}"
+    fi
+}
+
+if [ "${1}" == "--help" ] || [ "${1}" == "-h" ] || [ "${1}" == "help" ]; then
+    echo "Usage: dhl [OPTIONS]... <TRACKING_ID>"
+    echo "Show detailed tracking status the given DHL tracking ID."
+    echo ""
+    echo "  -l, --live           Track the parcel in real time with push notifications"
+elif [ "${1}" == "--live" ] || [ "${1}" == "-l" ]; then
+    DHL_TRACKING_ID="${2}"
+    clear
+    lastDhlStatus=""
+    while true; do
+        newDhlStatus="$(dhlGetTrackingStatus ${DHL_TRACKING_ID})"
+        if [ "${newDhlStatus}" != "${lastDhlStatus}" ]; then
+            echo -e "[DHL Live Tracking - Listening for updates...]\n\n${newDhlStatus}"
+            dhlNotification "${newDhlStatus}" "Update" true
+            lastDhlStatus="${newDhlStatus}"
+        fi
+        sleep ${DHL_UPDATE_DELAY}
+    done
+else
+    DHL_TRACKING_ID="${1}"
+    newDhlStatus="$(dhlGetTrackingStatus ${DHL_TRACKING_ID})"
+    echo -e "${newDhlStatus}"
+    dhlNotification "${newDhlStatus}"
+fi

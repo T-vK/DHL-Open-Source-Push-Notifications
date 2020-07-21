@@ -179,10 +179,20 @@ elif [ "${1}" == "--live" ] || [ "${1}" == "-l" ]; then
     lastDhlStatus=""
     while true; do
         newDhlStatus="$(dhlGetTrackingStatus ${DHL_TRACKING_ID})"
-        if [ "${newDhlStatus}" != "${lastDhlStatus}" ]; then
-            echo -e "[DHL Live Tracking - Listening for updates...]\n\n${newDhlStatus}"
+        # DHL's load balancing causes every request to go to a potentially different node
+        # so if you get a shorter response than last time, what you got is most likely outdated
+        # and thus no notification gets pushed for that iteration
+        if [ "${newDhlStatus}" != "${lastDhlStatus}" ] && (( ${#newDhlStatus} > ${#lastDhlStatus} )); then
+            if ! echo -e "${newDhlStatus}" | grep -q "Progress: 5/5"; then
+                echo -e "[DHL Live Tracking - Listening for updates...]\n"
+            fi
+            echo -e "${newDhlStatus}"
+            
             dhlNotification "${newDhlStatus}" "Update" true
             lastDhlStatus="${newDhlStatus}"
+            if echo -e "${newDhlStatus}" | grep -q "Progress: 5/5"; then
+                break
+            fi
         fi
         sleep ${DHL_UPDATE_DELAY}
     done
